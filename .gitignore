@@ -1,0 +1,7 @@
+# Price data is not committed
+futures_data/
+*.csv
+
+__pycache__/
+._*
+.DS_Store
