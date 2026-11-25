@@ -31,19 +31,20 @@ class Config:
     reward_risk: float = 1.0     # take-profit distance as a multiple of risk (1:1)
     swing_lookback: int = 2      # bars on each side that define a swing pivot
     start_date: str = "2016-1-1"
-    end_date: str = "2026-8-1"
+    end_date: str = "2026-10-16"
     open_start: time = time(9, 30)
     open_end: time = time(12, 10)   # only look for the FVG inside this window
     session_close: time = time(16, 0)
     entry_by: time = time(12, 10)   # retest must fill by this time, else skip the trade
     gap_bias: bool = True           # True: only short after a gap-up open, long after gap-down
-    csv_dir: str = r"F:/futures_data"  # folder of {SYMBOL}_1m.csv / {SYMBOL}_5m.csv
+    csv_dir: str = r"/volumes/t9/futures_data"  # folder of {SYMBOL}_1m.csv / {SYMBOL}_5m.csv
     account_start: float = 1_000_000  # starting cash for the compounding account sim
     risk_per_trade: float = 0.01    # fraction risked per trade (1%)
     compound_risk: bool = True    # True: 1% of the live balance (grows). False: flat 1% of the start
     currency: str = "£"             # symbol used when printing account balances
     slippage_ticks: float = 1.0     # round-turn slippage in ticks (limit entry ~0, ~1 on the stop exit)
-    fill_through_ticks: float = 0.0  # ticks price must trade BEYOND the limit before it fills
+    fill_through_ticks: float = 0.0  # ticks price must trade BEYOND a limit (entry AND target) to fill
+    slip_on_exits: tuple = ("stop", "close")  # exits that cross the spread and so pay slippage
     entry_offset_ticks: float = 0.0  # ticks to move the limit TOWARDS the market (worse fill price)
     is_start: str = "2024-01-01"    # start of the window used to pick the parameters
     is_end: str = "2024-06-30"      # end of it -- every other session is out-of-sample
@@ -143,24 +144,31 @@ def _simulate(day, i, direction, entry, stop, target, risk, cfg, tick=0.25) -> d
     old touch-is-a-fill assumption, which flatters the results because the touch-and-
     reverse cases are exactly the winners you would not have been filled on. The fill
     price is still the limit itself.
+
+    This applies to BOTH limits. The entry and the take-profit are the same kind of
+    order and face the same queue, so exempting the target would mean claiming passive
+    pricing with aggressive certainty. The stop is different: it becomes a market order
+    the moment it is touched, so a touch triggers it and it pays slippage instead.
     Returns None if the first FVG is never filled by cfg.entry_by.
     """
     h, l, c = (day[col].to_numpy() for col in ("high", "low", "close"))
     times = day.index.time
 
+    through = cfg.fill_through_ticks * tick     # how far past a limit price must trade
     entry_idx = None
     for j in range(i + 1, len(day)):
         if entry_idx is None:                      # still waiting for the retest
             if times[j] > cfg.entry_by:            # no fill within the entry window
                 return None
-            through = cfg.fill_through_ticks * tick   # how far past the limit price must go
             filled = (l[j] <= entry - through) if direction == 1 else (h[j] >= entry + through)
             if not filled:
                 continue
             entry_idx = j                          # limit fills at the gap edge
 
+        # Touching the stop triggers it (market order); the target has to trade through.
         hit_stop = l[j] <= stop if direction == 1 else h[j] >= stop
-        hit_target = h[j] >= target if direction == 1 else l[j] <= target
+        hit_target = ((h[j] >= target + through) if direction == 1
+                      else (l[j] <= target - through))
         if hit_stop:                               # conservative: stop wins ties
             exit_price, reason, exit_idx = stop, "stop", j
             break
@@ -345,7 +353,10 @@ def performance(trades: pd.DataFrame, cfg: Config) -> None:
     print(f"Reward:risk  : {cfg.reward_risk:g} : 1   (risk = 1.00 R per trade)")
     print(f"Stop         : most recent swing, {cfg.swing_lookback}-bar pivot")
     print(f"Entry window : {cfg.open_start:%H:%M}-{cfg.entry_by:%H:%M} ET")
-    print(f"Fill rule    : limit must trade through by {cfg.fill_through_ticks:g} tick(s)")
+    print(f"Fill rule    : entry and target limits must trade through by "
+          f"{cfg.fill_through_ticks:g} tick(s)")
+    print(f"Slippage on  : {', '.join(cfg.slip_on_exits)} exits only "
+          f"({cfg.slippage_ticks:g} tick round turn)")
     print(f"Limit offset : {cfg.entry_offset_ticks:g} tick(s) towards the market")
     print("Sharpe/day is the headline (same-day ES+NQ legs summed first, so their "
           "correlation is priced in); Sharpe/trade assumes independent trades and flatters.")
@@ -374,12 +385,23 @@ def dollar_risk(trades: pd.DataFrame, specs=None) -> pd.Series:
 
 
 def round_turn_cost(trades: pd.DataFrame, cfg: Config, specs=None) -> pd.Series:
-    """Round-turn cost of ONE contract: commission plus cfg.slippage_ticks of slippage,
-    each tick worth the market's tick value."""
+    """Round-turn cost of ONE contract: commission always, slippage only where the order
+    crossed the spread.
+
+    A stop becomes a market order the moment it triggers, and a run to the session close
+    is a market order outright, so both pay slippage -- those are cfg.slip_on_exits. A
+    take-profit is a resting limit: it fills at its price or not at all, so it pays none.
+    What a passive exit pays instead is fill UNCERTAINTY, which _simulate charges through
+    cfg.fill_through_ticks. Charging both would be taking the cost of crossing the spread
+    on a trade that never crossed it, and the old flat charge did exactly that on the
+    ~54% of trades that exited at target. Slippage is a round-turn total, so the limit
+    entry is already assumed to fill at its price.
+    """
     specs = specs or COST_SPECS
     commission = trades["future"].map(lambda s: specs[s][1])
     tick_value = trades["future"].map(lambda s: specs[s][2])
-    return commission + tick_value * cfg.slippage_ticks
+    crosses = trades["reason"].isin(cfg.slip_on_exits).astype(float)
+    return commission + tick_value * cfg.slippage_ticks * crosses
 
 
 def size_positions(trades: pd.DataFrame, cfg: Config, specs=None) -> pd.DataFrame:
